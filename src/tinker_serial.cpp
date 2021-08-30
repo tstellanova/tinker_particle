@@ -67,7 +67,7 @@ static int qgpsloc_cb(int type, const char* buf, int len, char* gps_loc_str);
 void on_gps_poll_enter() {
 	// Make GNSS the priority over WWAN.
 	Cellular.command(1000, "AT+QGPSCFG=\"priority\",0,0\r\n");
-	Cellular.command(1000, "AT+QGPS=1\r\n");
+	// Cellular.command(1000, "AT+QGPS=1\r\n");
 	digitalWrite(USER_LED_PIN, HIGH);
 }
 
@@ -94,7 +94,7 @@ void on_gps_poll_update() {
 void on_gps_poll_exit() {
 	// make wwan the priority
 	Cellular.command(1000, "AT+QGPSCFG=\"priority\",1,0\r\n");
-    Cellular.command(1000,"AT+QGPSEND\r\n");
+    // Cellular.command(1000,"AT+QGPSEND\r\n");
 	digitalWrite(USER_LED_PIN, LOW);
 }
 
@@ -167,7 +167,7 @@ void gps_pre_init() {
 	// Cellular.command(1000, "AT+QGPSCFG=\"priority\",1,1\r\n");
 
 	// finally, start a GPS session
-	//Cellular.command(1000, "AT+QGPS=1\r\n");
+	Cellular.command(1000, "AT+QGPS=1\r\n");
 
 }
 
@@ -244,6 +244,7 @@ void loop() {
 	else if (!gps_activated) {
 		gps_pre_init();
 		gps_activated = true;
+		delay(5000);
 		gps_fsm.trigger(ENABLE_GPS);
 		return;
 	}
