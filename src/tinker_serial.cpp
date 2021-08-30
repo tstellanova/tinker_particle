@@ -25,28 +25,83 @@
 // This version of Tinker separates system thread from user thread,
 // and makes the connection mode explicitly automatic.
 SYSTEM_THREAD(ENABLED);
-SYSTEM_MODE(SEMI_AUTOMATIC);
+SYSTEM_MODE(MANUAL);
+
+#include "fsm.h"
+
+
+// State machine triggers (events)
+#define FLIP_LIGHT_SWITCH 1
+#define MAKE_CONNECTION		2
+#define BREAK_CONNECTION	4
+#define ENABLE_GPS			8
+#define DISABLE_GPS			16
+
+
+const int USER_LED_PIN = D7;
+
 
 
 // We create a USB Serial log handler 
-// SerialLogHandler logHandler(LOG_LEVEL_ALL);
-SerialLogHandler logHandler(LOG_LEVEL_INFO, {
-    { "net.ppp.client", LOG_LEVEL_INFO },
-    { "ncp.at", LOG_LEVEL_ALL },
-    { "app", LOG_LEVEL_ALL },
-	{"gsm0710muxer", LOG_LEVEL_WARN},
-});
+SerialLogHandler logHandler(LOG_LEVEL_ALL);
+// SerialLogHandler logHandler(LOG_LEVEL_INFO, {
+//     { "net.ppp.client", LOG_LEVEL_ALL },
+//     { "ncp.at", LOG_LEVEL_ALL },
+//     { "app", LOG_LEVEL_ALL },
+// 	{"gsm0710muxer", LOG_LEVEL_WARN},
+// });
 
 static uint32_t last_gps_check_time = 0;
+static uint32_t last_gps_update_time = 0;
+
 static char last_gps_loc_str[92] = {};
+static char publish_buf[512] = {};
 
 
-/* Function prototypes -------------------------------------------------------*/
-int tinkerDigitalRead(String pin);
-int tinkerDigitalWrite(String command);
-int tinkerAnalogRead(String pin);
-int tinkerAnalogWrite(String command);
+// protos
+static int qgpsloc_cb(int type, const char* buf, int len, char* gps_loc_str);
 
+
+// State machine cb functions
+
+void on_gps_poll_enter() {
+	// Make GNSS the priority over WWAN.
+	Cellular.command(1000, "AT+QGPSCFG=\"priority\",0,0\r\n");
+	Cellular.command(1000, "AT+QGPS=1\r\n");
+	digitalWrite(USER_LED_PIN, HIGH);
+}
+
+void on_gps_poll_update() {
+	uint32_t cur_time = millis();
+	if ((cur_time - last_gps_check_time) > 15000) {
+		int gps_resp = Cellular.command(qgpsloc_cb, last_gps_loc_str, 1000, "AT+QGPSLOC=2\r\n");
+		last_gps_check_time = cur_time;
+		if (RESP_OK == gps_resp) {
+			// response format:
+			// +QGPSLOC: <UTC>,<latitude>,<longitude>,<HDOP>,<altitude>,<fix>,<COG>,<spkm>,<spkn>,<date>,<nsat>
+			// example: "022137.000,37.87512,-122.29062,0.8,11.8,3,0.00,0.0,0.0,280821,09"
+			// `170144.000,37.87508,-122.29074,1.3,38.4,2,0.00,0.0,0.0,280821,05`
+			
+			last_gps_update_time = cur_time;
+			Log.warn("GPSLOC resp: `%s`", last_gps_loc_str);
+		}
+		else {
+			last_gps_update_time = 0;
+		}
+	}
+}
+
+void on_gps_poll_exit() {
+	// make wwan the priority
+	Cellular.command(1000, "AT+QGPSCFG=\"priority\",1,0\r\n");
+    Cellular.command(1000,"AT+QGPSEND\r\n");
+	digitalWrite(USER_LED_PIN, LOW);
+}
+
+
+State state_gps_idle(nullptr, nullptr, nullptr);
+State state_gps_poll(on_gps_poll_enter, &on_gps_poll_update, &on_gps_poll_exit);
+Fsm gps_fsm(&state_gps_idle);
 
 /**
  * Parse response from AT+GMR
@@ -63,7 +118,9 @@ static int modem_id_str_cb(int type, const char* buf, int len, char* model_str)
   return WAIT;
 }
 
-void run_gps_setup() {
+void gps_pre_init() {
+	Log.info("=== pre-init gps ===");
+
 	char modem_str[64] = {};
  	Cellular.command(modem_id_str_cb, modem_str, 6000, "AT+GMR");    
 
@@ -94,20 +151,23 @@ void run_gps_setup() {
     // enable eDRX interval of 40 seconds
     // Note that this apparently needs to be longer than the GNSS reporting interval
     // (see Quectel GNSS App Note)
-    //Cellular.command(1000,"AT+CEDRXS=1,4,\"0011\"\r\n");
+    // Cellular.command(1000,"AT+CEDRXS=1,4,\"0011\"\r\n"); // 40 secs
+    // Cellular.command(1000,"AT+CEDRXS=1,4,\"0100\"\r\n"); // 60 secs
+	// Cellular.command(1000,"AT+CEDRXS=0,4\r\n"); //disable eDRX
 
     // Begin GPS
     Cellular.command(5000, "AT+QGPSCFG=\"outport\",\"none\"");    // disable NMEA output
     // Cellular.command(5000, "AT+QGPSCFG=\"outport\",\"uartnmea\"");    // specified GPX_TX pin to output nmea data
     // Cellular.command(5000, "AT+QGPSCFG=\"outport\",\"usbnmea\"");     // specified usb port to output nmea data
 
-    // Make GPS the priority vs WWAN.
-    // This appears to give a GNSS lock faster at startup.
-    // Once a lock has been obtained you can swap the priority back
-    Cellular.command(1000, "AT+QGPSCFG=\"priority\",0,1\r\n");
+    // Make GNSS the priority over WWAN.
+    // Cellular.command(1000, "AT+QGPSCFG=\"priority\",0,1\r\n");
 
-	auto res = Cellular.command(1000, "AT+QGPS=1\r\n");
-	Log.info("QPGS result: %d", res);
+	// Make WWAN the priority over GNSS (GNSS will read while WWAN is sleeping)
+	// Cellular.command(1000, "AT+QGPSCFG=\"priority\",1,1\r\n");
+
+	// finally, start a GPS session
+	//Cellular.command(1000, "AT+QGPS=1\r\n");
 
 }
 
@@ -118,23 +178,37 @@ void setup() {
 	// Serial.begin();
 	delay(3000);
 	Log.info("==== setup ====");
+	pinMode(USER_LED_PIN, OUTPUT);
+
 	// Cellular.setActiveSim(INTERNAL_SIM);
 
-	// Register all the Tinker cloud functions. 
-	// These can be called from the Particle Cloud console or eg the mobile app. 
-	Particle.function("digitalread", tinkerDigitalRead);
-	Particle.function("digitalwrite", tinkerDigitalWrite);
-	Particle.function("analogread", tinkerAnalogRead);
-	Particle.function("analogwrite", tinkerAnalogWrite);
+	//Cellular.command("ATI0\r\n");
+	//Cellular.command("ATI9\r\n");
+	//Cellular.command("AT+CCID\r\n");
 
-	Cellular.command("ATI0\r\n");
-	Cellular.command("ATI9\r\n");
+	// ensure that a GNSS session is not runnin
+    // Cellular.command(1000,"AT+QGPSEND\r\n");
 
-	Cellular.command("AT+CCID?\r\n");
+	// set WWAN as the priority over GNSS before enabling eDRX
+	Cellular.command(1000, "AT+QGPSCFG=\"priority\",1,1\r\n");
 
-	// run_gps_setup();
-	// delay(3000);
+	// set eDRX interval
+    // Cellular.command(1000,"AT+CEDRXS=1,4,\"0100\"\r\n"); // 60 secs
 
+	// fsm.add_transition(&state_light_on, &state_light_off,
+	// 					FLIP_LIGHT_SWITCH,
+	// 					&on_trans_light_on_light_off);
+	// fsm.add_transition(&state_light_off, &state_light_on,
+	// 					FLIP_LIGHT_SWITCH,
+	// 					&on_trans_light_off_light_on);
+	// fsm.run_machine();
+
+	gps_fsm.add_transition(&state_gps_idle, &state_gps_poll, ENABLE_GPS, nullptr);
+	gps_fsm.add_transition(&state_gps_poll, &state_gps_idle, DISABLE_GPS, nullptr);
+	gps_fsm.run_machine();
+
+	delay(3000);
+	Log.info("=== Starting first Particle.connect ===");
 	Particle.connect();
 
 }
@@ -158,162 +232,41 @@ static int qgpsloc_cb(int type, const char* buf, int len, char* gps_loc_str)
 
 /* This function loops forever --------------------------------------------*/
 void loop() {
-	static bool gps_once = false;
+	static bool gps_activated = false;
+
 	//This will run in a loop
 	if (!Particle.connected()) {
-		Log.info("connection wait...");
-		Cellular.command("AT+CCID?\r\n");
+		Log.info("=== connection wait... ===");
+		Cellular.command("AT+CCID\r\n");
 		delay(3000);
 		return;
 	}
-	uint32_t cur_time = millis();
-  	if ((cur_time - last_gps_check_time) >= 10000) {
-		int gps_resp = Cellular.command(qgpsloc_cb, last_gps_loc_str, 1000, "AT+QGPSLOC=2\r\n");
-		if (RESP_OK == gps_resp) {
-			Log.info("GPSLOC: %s", last_gps_loc_str);
-			if (!Particle.connected()) {
-				Log.info("reconnect particle!");
-				Particle.connect();
-				waitFor(Particle.connected, 30000);
+	else if (!gps_activated) {
+		gps_pre_init();
+		gps_activated = true;
+		gps_fsm.trigger(ENABLE_GPS);
+		return;
+	}
+	else {
+		gps_fsm.run_machine();
+		if (last_gps_update_time > 0) {
+			gps_fsm.trigger(DISABLE_GPS);
+			sprintf(publish_buf, "{ \"time\": %lu, \"gpsloc2\": \"%s\" }",last_gps_update_time, last_gps_loc_str);
+			Log.trace("publish....");
+			bool acked = Particle.publish("bg77raw",publish_buf,WITH_ACK);
+			if (acked) {
+				last_gps_update_time = 0;
+				gps_fsm.trigger(ENABLE_GPS);
+			}
+			else {
+				Log.warn("publish failed!");
+				gps_fsm.trigger(DISABLE_GPS);
 			}
 		}
-		else if ((-3 == gps_resp) && !gps_once) {
-			Log.warn("error 505 ?");
-			run_gps_setup();
-			gps_once = true;
-			delay(3000);
-
-			auto res = Cellular.command(1000, "AT+QGPS=1\r\n");
-			Log.info("QPGS result: %d", res);
-		}
-		else {
-			Log.warn("error: %d", gps_resp);
-		}
-		last_gps_check_time = cur_time;
-  	}
-	else {
-		delay(3000);
 
 	}
+		  
 
-}
 
-/*******************************************************************************
- * Function Name  : tinkerDigitalRead
- * Description    : Reads the digital value of a given pin
- * Input          : Pin
- * Output         : None.
- * Return         : Value of the pin (0 or 1) in INT type
-                    Returns a negative number on failure
- *******************************************************************************/
-int tinkerDigitalRead(String param) {
-
-	Log.info("digitalRead: %s", param.c_str());
-
-	//convert ascii to integer
-	int pinNumber = param.charAt(1) - '0';
-	//Sanity check to see if the pin numbers are within limits
-	if (pinNumber < 0 || pinNumber > 7) return -1;
-
-	if(param.startsWith("D")) {
-		pinMode(pinNumber, INPUT_PULLDOWN);
-		return digitalRead(pinNumber);
-	}
-	else if (param.startsWith("A")) {
-		pinMode(pinNumber+10, INPUT_PULLDOWN);
-		return digitalRead(pinNumber+10);
-	}
-	return -2;
-}
-
-/*******************************************************************************
- * Function Name  : tinkerDigitalWrite
- * Description    : Sets the specified pin HIGH or LOW
- * Input          : Pin and value
- * Output         : None.
- * Return         : 1 on success and a negative number on failure
- *******************************************************************************/
-int tinkerDigitalWrite(String param) {
-	Log.info("digitalWrite: %s", param.c_str());
-
-	bool value = 0;
-	//convert ascii to integer
-	int pinNumber = param.charAt(1) - '0';
-	//Sanity check to see if the pin numbers are within limits
-	if (pinNumber< 0 || pinNumber >7) return -1;
-
-	if (param.substring(3,7) == "HIGH") value = 1;
-	else if (param.substring(3,6) == "LOW") value = 0;
-	else return -2;
-
-	if (param.startsWith("D")) {
-		pinMode(pinNumber, OUTPUT);
-		digitalWrite(pinNumber, value);
-		return 1;
-	}
-	else if(param.startsWith("A")) {
-		pinMode(pinNumber+10, OUTPUT);
-		digitalWrite(pinNumber+10, value);
-		return 1;
-	}
-	else return -3;
-}
-
-/*******************************************************************************
- * Function Name  : tinkerAnalogRead
- * Description    : Reads the analog value of a pin
- * Input          : Pin
- * Output         : None.
- * Return         : Returns the analog value in INT type (0 to 4095)
-                    Returns a negative number on failure
- *******************************************************************************/
-int tinkerAnalogRead(String param) {
-
-	Log.info("analogRead: %s", param.c_str());
-
-	//convert ascii to integer
-	int pinNumber = param.charAt(1) - '0';
-	//Sanity check to see if the pin numbers are within limits
-	if (pinNumber < 0 || pinNumber > 7) return -1;
-
-	if(param.startsWith("D")) {
-		return -3;
-	}
-	else if (param.startsWith("A")) {
-		return analogRead(pinNumber+10);
-	}
-
-	return -2;
-}
-
-/*******************************************************************************
- * Function Name  : tinkerAnalogWrite
- * Description    : Writes an analog value (PWM) to the specified pin
- * Input          : Pin and Value (0 to 255)
- * Output         : None.
- * Return         : 1 on success and a negative number on failure
- *******************************************************************************/
-int tinkerAnalogWrite(String param)
-{
-	Log.info("analogWrite: %s", param.c_str());
-
-	//convert ascii to integer
-	int pinNumber = param.charAt(1) - '0';
-	//Sanity check to see if the pin numbers are within limits
-	if (pinNumber < 0 || pinNumber > 7) return -1;
-
-	String value = param.substring(3);
-
-	if(param.startsWith("D")) {
-		pinMode(pinNumber, OUTPUT);
-		analogWrite(pinNumber, value.toInt());
-		return 1;
-	}
-	else if(param.startsWith("A")) {
-		pinMode(pinNumber+10, OUTPUT);
-		analogWrite(pinNumber+10, value.toInt());
-		return 1;
-	}
-	else return -2;
 }
 
