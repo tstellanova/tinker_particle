@@ -41,6 +41,7 @@ SYSTEM_MODE(MANUAL);
 const int USER_LED_PIN = D7;
 
 
+static uint32_t gps_lock_count = 0;
 
 // We create a USB Serial log handler 
 SerialLogHandler logHandler(LOG_LEVEL_ALL);
@@ -64,16 +65,46 @@ static int qgpsloc_cb(int type, const char* buf, int len, char* gps_loc_str);
 
 // State machine cb functions
 
+void set_gps_priority(bool enable) {
+	if (enable) {
+		// Make GNSS the priority over WWAN.
+		Cellular.command(1000, "AT+QGPSCFG=\"priority\",0,0\r\n");
+		digitalWrite(USER_LED_PIN, HIGH);
+	}
+	else {
+		// Make WWAN priority over GNSS
+		Cellular.command(1000, "AT+QGPSCFG=\"priority\",1,0\r\n");
+		digitalWrite(USER_LED_PIN, LOW);
+
+		//check eDRX
+		// Cellular.command("AT+CEDRXRDP\r\n");
+	}
+}
+
+void gps_begin_session() {
+	Cellular.command(1000, "AT+QGPS=1\r\n");
+}
+
+void gps_end_session() {
+    Cellular.command(1000,"AT+QGPSEND\r\n");
+}
+
 void on_gps_poll_enter() {
-	// Make GNSS the priority over WWAN.
-	Cellular.command(1000, "AT+QGPSCFG=\"priority\",0,0\r\n");
-	// Cellular.command(1000, "AT+QGPS=1\r\n");
-	digitalWrite(USER_LED_PIN, HIGH);
+	if (0 == gps_lock_count) {
+		gps_begin_session();
+		set_gps_priority(true);
+	}
 }
 
 void on_gps_poll_update() {
 	uint32_t cur_time = millis();
 	if ((cur_time - last_gps_check_time) > 15000) {
+
+		if (gps_lock_count > 0) {
+			set_gps_priority(true);
+			delay(1500);//time to switch priorities
+		}
+
 		int gps_resp = Cellular.command(qgpsloc_cb, last_gps_loc_str, 1000, "AT+QGPSLOC=2\r\n");
 		last_gps_check_time = cur_time;
 		if (RESP_OK == gps_resp) {
@@ -83,19 +114,22 @@ void on_gps_poll_update() {
 			// `170144.000,37.87508,-122.29074,1.3,38.4,2,0.00,0.0,0.0,280821,05`
 			
 			last_gps_update_time = cur_time;
+			gps_lock_count += 1;
 			Log.warn("GPSLOC resp: `%s`", last_gps_loc_str);
+			set_gps_priority(false);
+	
 		}
 		else {
 			last_gps_update_time = 0;
 		}
 	}
+
 }
 
 void on_gps_poll_exit() {
-	// make wwan the priority
-	Cellular.command(1000, "AT+QGPSCFG=\"priority\",1,0\r\n");
-    // Cellular.command(1000,"AT+QGPSEND\r\n");
-	digitalWrite(USER_LED_PIN, LOW);
+	if (0 == gps_lock_count) {
+		set_gps_priority(false);
+	}
 }
 
 
@@ -117,6 +151,8 @@ static int modem_id_str_cb(int type, const char* buf, int len, char* model_str)
 
   return WAIT;
 }
+
+
 
 void gps_pre_init() {
 	Log.info("=== pre-init gps ===");
@@ -140,7 +176,7 @@ void gps_pre_init() {
 
     // Disable existing GPS session, if any
     // This is necessary to ensure subsequent GPS cfg statements are effective
-    Cellular.command(1000,"AT+QGPSEND\r\n");
+    gps_end_session();
 
     // prep for gpsOneXTRA (correction) file download
     Cellular.command(1000,"AT+QGPSXTRA=1\r\n");
@@ -151,9 +187,11 @@ void gps_pre_init() {
     // enable eDRX interval of 40 seconds
     // Note that this apparently needs to be longer than the GNSS reporting interval
     // (see Quectel GNSS App Note)
+	// Cellular.command(1000,"AT+CEDRXS=0,4\r\n"); //disable eDRX
     // Cellular.command(1000,"AT+CEDRXS=1,4,\"0011\"\r\n"); // 40 secs
     // Cellular.command(1000,"AT+CEDRXS=1,4,\"0100\"\r\n"); // 60 secs
-	// Cellular.command(1000,"AT+CEDRXS=0,4\r\n"); //disable eDRX
+	Cellular.command(1000,"AT+CEDRXS=1,4,\"0111\"\r\n"); // 122 secs
+
 
     // Begin GPS
     Cellular.command(5000, "AT+QGPSCFG=\"outport\",\"none\"");    // disable NMEA output
@@ -165,9 +203,6 @@ void gps_pre_init() {
 
 	// Make WWAN the priority over GNSS (GNSS will read while WWAN is sleeping)
 	// Cellular.command(1000, "AT+QGPSCFG=\"priority\",1,1\r\n");
-
-	// finally, start a GPS session
-	Cellular.command(1000, "AT+QGPS=1\r\n");
 
 }
 
@@ -194,14 +229,6 @@ void setup() {
 
 	// set eDRX interval
     // Cellular.command(1000,"AT+CEDRXS=1,4,\"0100\"\r\n"); // 60 secs
-
-	// fsm.add_transition(&state_light_on, &state_light_off,
-	// 					FLIP_LIGHT_SWITCH,
-	// 					&on_trans_light_on_light_off);
-	// fsm.add_transition(&state_light_off, &state_light_on,
-	// 					FLIP_LIGHT_SWITCH,
-	// 					&on_trans_light_off_light_on);
-	// fsm.run_machine();
 
 	gps_fsm.add_transition(&state_gps_idle, &state_gps_poll, ENABLE_GPS, nullptr);
 	gps_fsm.add_transition(&state_gps_poll, &state_gps_idle, DISABLE_GPS, nullptr);
@@ -258,12 +285,15 @@ void loop() {
 			if (acked) {
 				last_gps_update_time = 0;
 				gps_fsm.trigger(ENABLE_GPS);
+				Log.info("published: %d", gps_lock_count);
 			}
 			else {
 				Log.warn("publish failed!");
 				gps_fsm.trigger(DISABLE_GPS);
+				gps_end_session();
 			}
 		}
+
 
 	}
 		  
